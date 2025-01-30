@@ -2,7 +2,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// Move window-dependent logic to a custom hook
+const WS_PORT = 8080;
+
 function useWindowSize() {
   const [screenSize, setScreenSize] = useState({
     width: 0,
@@ -17,7 +18,6 @@ function useWindowSize() {
       });
     }
 
-    // Only run on client-side
     handleResize();
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
@@ -32,94 +32,81 @@ export default function Home() {
   const [isWarning, setIsWarning] = useState(false);
   const [showWarningMessage, setShowWarningMessage] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [showSwitchingMessage, setShowSwitchingMessage] = useState(false);
   const screenSize = useWindowSize();
   const audioRef = useRef(null);
   const hasPlayedBeep = useRef(false);
   const warningTimeoutRef = useRef(null);
+  const wsRef = useRef(null);
   const lastUpdateTimeRef = useRef(null);
-  const broadcastChannelRef = useRef(null);
+  const timerIntervalRef = useRef(null);
 
-  // Initialize BroadcastChannel on mount
+  // Initialize WebSocket connection
   useEffect(() => {
-    broadcastChannelRef.current = new BroadcastChannel('timer-channel');
-    
-    broadcastChannelRef.current.onmessage = (event) => {
-      const { type, payload } = event.data;
+    const connectWebSocket = () => {
+      const ws = new WebSocket(`ws://${window.location.hostname}:${WS_PORT}`);
       
-      switch (type) {
-        case 'TIMER_UPDATE':
-          setTimeLeft(payload.timeLeft);
-          setIsRunning(payload.isRunning);
-          break;
-        case 'REQUEST_SYNC':
-          if (timeLeft !== 600) {
-            broadcastChannelRef.current.postMessage({
-              type: 'SYNC_RESPONSE',
-              payload: {
-                timeLeft,
-                isRunning,
-                lastUpdateTime: lastUpdateTimeRef.current
-              }
-            });
-          }
-          break;
-        case 'SYNC_RESPONSE':
-          if (!lastUpdateTimeRef.current) {
-            const { timeLeft: syncedTime, isRunning: syncedIsRunning, lastUpdateTime } = payload;
-            const currentTime = Date.now();
-            const timeElapsed = Math.floor((currentTime - lastUpdateTime) / 1000);
-            const newTimeLeft = Math.max(0, syncedTime - (syncedIsRunning ? timeElapsed : 0));
-            setTimeLeft(newTimeLeft);
-            setIsRunning(syncedIsRunning && newTimeLeft > 0);
-          }
-          break;
-      }
+      ws.onopen = () => {
+        console.log('WebSocket Connected');
+        setWsConnected(true);
+        ws.send(JSON.stringify({ type: 'REQUEST_SYNC' }));
+      };
+
+      ws.onclose = () => {
+        console.log('WebSocket Disconnected');
+        setWsConnected(false);
+        setTimeout(connectWebSocket, 5000);
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        switch (data.type) {
+          case 'TIMER_UPDATE':
+            setTimeLeft(data.payload.timeLeft);
+            setIsRunning(data.payload.isRunning);
+            setShowSwitchingMessage(data.payload.timeLeft === 0);
+            lastUpdateTimeRef.current = Date.now();
+            break;
+          case 'REQUEST_SYNC':
+            if (timeLeft !== 600) {
+              ws.send(JSON.stringify({
+                type: 'SYNC_RESPONSE',
+                payload: {
+                  timeLeft,
+                  isRunning,
+                  lastUpdateTime: lastUpdateTimeRef.current
+                }
+              }));
+            }
+            break;
+          case 'SYNC_RESPONSE':
+            if (!lastUpdateTimeRef.current) {
+              const { timeLeft: syncedTime, isRunning: syncedIsRunning, lastUpdateTime } = data.payload;
+              const currentTime = Date.now();
+              const timeElapsed = Math.floor((currentTime - lastUpdateTime) / 1000);
+              const newTimeLeft = Math.max(0, syncedTime - (syncedIsRunning ? timeElapsed : 0));
+              setTimeLeft(newTimeLeft);
+              setIsRunning(syncedIsRunning && newTimeLeft > 0);
+              setShowSwitchingMessage(newTimeLeft === 0);
+              lastUpdateTimeRef.current = currentTime;
+            }
+            break;
+        }
+      };
+
+      wsRef.current = ws;
     };
 
-    broadcastChannelRef.current.postMessage({
-      type: 'REQUEST_SYNC'
-    });
+    connectWebSocket();
 
     return () => {
-      broadcastChannelRef.current.close();
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
     };
   }, []);
-
-  // Load saved state
-  useEffect(() => {
-    const savedState = localStorage.getItem('timerState');
-    if (savedState) {
-      const { timeLeft: savedTime, isRunning: savedIsRunning, lastUpdateTime } = JSON.parse(savedState);
-      const currentTime = Date.now();
-      const timeElapsed = Math.floor((currentTime - lastUpdateTime) / 1000);
-      const newTimeLeft = Math.max(0, savedTime - (savedIsRunning ? timeElapsed : 0));
-      setTimeLeft(newTimeLeft);
-      setIsRunning(savedIsRunning && newTimeLeft > 0);
-    }
-    lastUpdateTimeRef.current = Date.now();
-  }, []);
-
-  // Save state updates
-  useEffect(() => {
-    const currentTime = Date.now();
-    lastUpdateTimeRef.current = currentTime;
-    
-    localStorage.setItem('timerState', JSON.stringify({
-      timeLeft,
-      isRunning,
-      lastUpdateTime: currentTime
-    }));
-
-    if (broadcastChannelRef.current) {
-      broadcastChannelRef.current.postMessage({
-        type: 'TIMER_UPDATE',
-        payload: {
-          timeLeft,
-          isRunning
-        }
-      });
-    }
-  }, [timeLeft, isRunning]);
 
   // Initialize audio context
   useEffect(() => {
@@ -162,18 +149,52 @@ export default function Home() {
 
   // Timer countdown
   useEffect(() => {
-    let timer;
     if (isRunning && timeLeft > 0) {
-      timer = setInterval(() => {
-        setTimeLeft(prev => prev - 1);
-      }, 1000);
-    }
-    return () => clearInterval(timer);
-  }, [isRunning, timeLeft]);
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+      }
 
-  // Warning handling
+      const startTime = Date.now();
+      const initialTimeLeft = timeLeft;
+
+      timerIntervalRef.current = setInterval(() => {
+        const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+        const newTimeLeft = Math.max(0, initialTimeLeft - elapsedSeconds);
+        
+        setTimeLeft(newTimeLeft);
+        setShowSwitchingMessage(newTimeLeft === 0);
+
+        if (newTimeLeft === 0) {
+          clearInterval(timerIntervalRef.current);
+          setIsRunning(false);
+        }
+
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({
+            type: 'TIMER_UPDATE',
+            payload: {
+              timeLeft: newTimeLeft,
+              isRunning: newTimeLeft > 0
+            }
+          }));
+        }
+      }, 1000);
+    } else {
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+      }
+    }
+
+    return () => {
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+      }
+    };
+  }, [isRunning]);
+
+  // Warning handling - Modified for 30 seconds and quick disappearance
   useEffect(() => {
-    if (timeLeft === 20) {
+    if (timeLeft === 30) {
       setIsWarning(true);
       setShowWarningMessage(true);
       if (!hasPlayedBeep.current && audioRef.current) {
@@ -182,7 +203,7 @@ export default function Home() {
       }
       warningTimeoutRef.current = setTimeout(() => {
         setShowWarningMessage(false);
-      }, 1000);
+      }, 500); // Reduced to 500ms for quicker disappearance
     } else if (timeLeft === 0) {
       setIsWarning(false);
       setShowWarningMessage(false);
@@ -199,7 +220,7 @@ export default function Home() {
 
   const getTimerSize = () => {
     if (screenSize.width === 0 || screenSize.height === 0) {
-      return 400; // Default size during SSR
+      return 400;
     }
     const size = Math.min(screenSize.width * 0.8, screenSize.height * 0.6);
     return Math.min(size, 500);
@@ -214,8 +235,37 @@ export default function Home() {
     setIsRunning(false);
     setIsWarning(false);
     setShowWarningMessage(false);
+    setShowSwitchingMessage(false);
     hasPlayedBeep.current = false;
-    localStorage.removeItem('timerState');
+    
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'TIMER_UPDATE',
+        payload: {
+          timeLeft: 600,
+          isRunning: false
+        }
+      }));
+    }
+  };
+
+  const toggleTimer = () => {
+    if (timeLeft === 0) {
+      resetTimer();
+    }
+    const newIsRunning = !isRunning;
+    setIsRunning(newIsRunning);
+    setShowSwitchingMessage(false);
+    
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'TIMER_UPDATE',
+        payload: {
+          timeLeft,
+          isRunning: newIsRunning
+        }
+      }));
+    }
   };
 
   return (
@@ -233,6 +283,13 @@ export default function Home() {
       `}</style>
 
       <main className="w-screen h-screen flex flex-col items-center justify-between p-4 bg-gray-900 text-white">
+        <div className="fixed top-4 right-4 flex items-center gap-2">
+          <span className={`h-3 w-3 rounded-full ${wsConnected ? 'bg-green-500' : 'bg-red-500'}`}></span>
+          <span className="text-sm text-gray-400">
+            {wsConnected ? 'Connected' : 'Disconnected'}
+          </span>
+        </div>
+
         <motion.div
           initial={{ opacity: 0, y: -20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -262,7 +319,7 @@ export default function Home() {
             }}
           >
             <motion.div 
-              className="text-4xl sm:text-6xl md:text-8xl font-bold"
+              className="text-4xl sm:text-6xl md:text-8xl font-bold text-center"
               animate={{
                 color: isWarning ? ['#ffffff', '#ff0000'] : '#ffffff',
               }}
@@ -272,7 +329,17 @@ export default function Home() {
                 repeatType: "reverse"
               }}
             >
-              {`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`}
+              {showSwitchingMessage ? (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.8 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="text-3xl sm:text-5xl md:text-6xl text-yellow-400"
+                >
+                  Switching<br/>Teammate!
+                </motion.div>
+              ) : (
+                `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+              )}
             </motion.div>
           </div>
         </motion.div>
@@ -281,7 +348,7 @@ export default function Home() {
           <motion.button
             whileHover={{ scale: 1.1 }}
             whileTap={{ scale: 0.95 }}
-            onClick={() => setIsRunning(!isRunning)}
+            onClick={toggleTimer}
             className={`px-4 md:px-8 py-3 md:py-4 rounded-lg text-lg md:text-xl font-bold transition ${
               isRunning ? 'bg-red-500 hover:bg-red-600' : 'bg-green-500 hover:bg-green-600'
             }`}
@@ -317,7 +384,7 @@ export default function Home() {
               className="fixed inset-0 flex items-center justify-center bg-red-500 bg-opacity-90 z-50"
             >
               <div className="text-4xl md:text-6xl font-bold text-white text-center p-8">
-                20 SECONDS REMAINING!
+                30 SECONDS REMAINING!
               </div>
             </motion.div>
           )}
