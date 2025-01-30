@@ -15,7 +15,11 @@
 }
 
 body {
-  color: var(--foreground);
-  background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+  margin: 0;
+  padding: 0;
+  font-family: 'Space Mono', monospace;
+  background: rgb(17, 24, 39);
+  overflow: hidden;
+  width: 100vw;
+  height: 100vh;
 }
